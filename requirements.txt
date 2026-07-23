@@ -1,0 +1,4 @@
+streamlit>=1.35,<2
+pandas>=2.2,<3
+plotly>=5.22,<7
+pywin32>=306; platform_system == "Windows"
