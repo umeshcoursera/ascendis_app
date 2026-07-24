@@ -54,7 +54,30 @@ def tidy_tables(tables: list[RawTable]) -> pd.DataFrame:
     return combine_summary_tables(tables)
 
 
-def build_plot(data: pd.DataFrame, plot_type: str, show_error: bool):
+def build_plot(data: pd.DataFrame, plot_type: str, show_error: bool, layout: str):
+    if layout == "categorical":
+        chart_data = data.copy()
+        chart_data["item"] = chart_data["parameter"] + " — " + chart_data["visit"]
+        figure = px.bar(
+            chart_data,
+            x="value",
+            y="item",
+            color="group",
+            orientation="h",
+            barmode="group",
+            custom_data=["n", "source_table", "parameter", "visit", "metric"],
+            labels={"value": chart_data["metric"].iloc[0], "item": "Reported term", "group": "Group"},
+            category_orders={"item": chart_data["item"].drop_duplicates().tolist()[::-1]},
+        )
+        figure.update_traces(
+            hovertemplate=(
+                "%{customdata[2]}<br>%{customdata[3]}<br>Value: %{x:.1f}"
+                "<br>n: %{customdata[0]}<br>Table: %{customdata[1]}<extra>%{fullData.name}</extra>"
+            )
+        )
+        figure.update_layout(height=max(480, min(1100, 34 * chart_data["item"].nunique())), yaxis={"automargin": True})
+        return figure
+
     visit_levels = ordered_visits(data)
     parameters = data["parameter"].drop_duplicates().tolist()
     facet_options = {
@@ -102,8 +125,8 @@ def build_plot(data: pd.DataFrame, plot_type: str, show_error: bool):
 
 st.title("Longitudinal Word Table Explorer")
 st.caption(
-    "Combines report tables across pages, discovers subgroup parameters, and plots visits over time. "
-    "Total columns are retained."
+    "Extracts longitudinal summaries and clinical report listings, combines continuation pages into long data, "
+    "and chooses a trend or ranked cohort-comparison figure. Total columns are retained."
 )
 
 uploaded = st.file_uploader("Word report", type=["docx", "doc", "rtf"])
@@ -133,6 +156,12 @@ selected_ids = st.sidebar.multiselect("Tables/pages", table_options, default=tab
 selected_tables = [table for table in all_tables if table.index in selected_ids]
 combined = tidy_tables(selected_tables)
 
+# Streamlit can retain a cached dataframe created by an earlier parser version.
+# Treat such data as the original longitudinal format so an app upgrade does not
+# fail before the cache naturally expires.
+if not combined.empty and "layout" not in combined.columns:
+    combined = combined.assign(layout="longitudinal")
+
 if combined.empty:
     st.warning("The selected tables do not contain a recognizable visit-by-group summary layout.")
 else:
@@ -142,12 +171,19 @@ else:
         labels = ", ".join(f"Table {table_id}" for table_id in unparsed_table_ids)
         st.info(f"No trend layout was detected in: {labels}. These tables remain available below.")
 
-    measures = combined["measure"].drop_duplicates().tolist()
+    layouts = combined["layout"].drop_duplicates().tolist()
+    selected_layout = st.sidebar.selectbox(
+        "Table layout", layouts, format_func=lambda value: "Longitudinal trends" if value == "longitudinal" else "Clinical categories"
+    )
+    layout_data = combined[combined["layout"] == selected_layout]
+
+    measures = layout_data["measure"].drop_duplicates().tolist()
     selected_measure = st.sidebar.selectbox("Measure", measures)
-    measure_data = combined[combined["measure"] == selected_measure]
+    measure_data = layout_data[layout_data["measure"] == selected_measure]
 
     metrics = measure_data["metric"].drop_duplicates().tolist()
-    default_metric = metrics.index("Mean") if "Mean" in metrics else 0
+    preferred_metric = "Mean" if selected_layout == "longitudinal" else "Percent"
+    default_metric = metrics.index(preferred_metric) if preferred_metric in metrics else 0
     selected_metric = st.sidebar.selectbox("Statistic", metrics, index=default_metric)
     metric_data = measure_data[measure_data["metric"] == selected_metric]
 
@@ -161,8 +197,21 @@ else:
         metric_data["parameter"].isin(selected_parameters) & metric_data["group"].isin(selected_groups)
     ].copy()
 
-    auto_plot = "Line" if plot_data["visit"].nunique() > 1 else "Bar"
-    plot_choice = st.sidebar.selectbox("Figure", ["Auto", "Line", "Bar", "Scatter"])
+    term_limit = None
+    if selected_layout == "categorical":
+        term_limit = st.sidebar.slider("Most frequent terms", min_value=5, max_value=40, value=15, step=5)
+        ranking_group = next((group for group in selected_groups if "total" in group.lower()), selected_groups[0] if selected_groups else None)
+        rank_source = plot_data[plot_data["group"] == ranking_group] if ranking_group else plot_data
+        top_terms = (
+            rank_source.groupby(["parameter", "visit"], as_index=False)["value"].max()
+            .nlargest(term_limit, "value")
+        )
+        selected_terms = set(zip(top_terms["parameter"], top_terms["visit"]))
+        plot_data = plot_data[plot_data.apply(lambda row: (row["parameter"], row["visit"]) in selected_terms, axis=1)]
+
+    auto_plot = "Line" if selected_layout == "longitudinal" and plot_data["visit"].nunique() > 1 else "Bar"
+    figure_options = ["Auto", "Line", "Bar", "Scatter"] if selected_layout == "longitudinal" else ["Auto", "Bar"]
+    plot_choice = st.sidebar.selectbox("Figure", figure_options)
     plot_type = auto_plot if plot_choice == "Auto" else plot_choice
     show_error = st.sidebar.checkbox("Show variability/error", value=True)
 
@@ -177,7 +226,7 @@ else:
     else:
         title_measure = plot_data["measure"].mode().iloc[0]
         st.subheader(title_measure)
-        figure = build_plot(plot_data, plot_type, show_error)
+        figure = build_plot(plot_data, plot_type, show_error, selected_layout)
         st.plotly_chart(figure, width="stretch")
 
         export = plot_data.sort_values(["parameter", "visit_order", "group"])
